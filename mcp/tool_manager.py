@@ -115,6 +115,8 @@ class Tool:
     timeout_s:   float = 30.0
     supports_rerank: bool = False            # 是否支持结果重排
     fallback:    Optional[Callable] = None    # sync/async (params, context, error) -> Any
+    allowed_agents: frozenset[str] = field(default_factory=frozenset)
+    # 空集合表示仅供系统内部直接调用，不向任何 Agent 暴露。
 
     # 运行时状态（不参与构造）
     stats:   ToolStats    = field(default_factory=ToolStats, init=False)
@@ -143,11 +145,30 @@ class MCPToolManager:
     # ── 注册 / 注销 ───────────────────────────────────────────────────────────
 
     def register(self, tool: Tool) -> None:
+        self._validate_tool_definition(tool)
+        if tool.name in self._tools:
+            raise ValueError(f"工具重复注册: {tool.name}")
         self._tools[tool.name] = tool
         logger.info(f"注册工具: {tool.name}")
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
+
+    def get_tools_for_agent(self, agent_type: Any) -> List[Tool]:
+        """返回指定 Agent 被授权使用的工具。"""
+        agent_name = self._agent_name(agent_type)
+        return [tool for tool in self._tools.values() if agent_name in tool.allowed_agents]
+
+    def anthropic_tools_for_agent(self, agent_type: Any) -> List[Dict[str, Any]]:
+        """将 Agent 可用工具转换为 Anthropic Messages API 的 tools 格式。"""
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.schema,
+            }
+            for tool in self.get_tools_for_agent(agent_type)
+        ]
 
     # ── 核心调用 ──────────────────────────────────────────────────────────────
 
@@ -159,6 +180,7 @@ class MCPToolManager:
         *,
         use_cache: bool = True,
         rerank_top_k: int = 0,          # >0 时对结果重排，取 Top-K
+        caller_agent: Optional[Any] = None,
     ) -> ToolResult:
         """
         调用工具，完整执行链：
@@ -167,6 +189,16 @@ class MCPToolManager:
         tool = self._tools.get(name)
         if not tool:
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
+
+        if caller_agent is not None:
+            agent_name = self._agent_name(caller_agent)
+            if agent_name not in tool.allowed_agents:
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    tool_name=name,
+                    error=f"Agent {agent_name} 无权调用工具: {name}",
+                )
 
         # 缓存命中
         if use_cache and tool.cache_ttl > 0:
@@ -381,6 +413,43 @@ class MCPToolManager:
     # ── 参数校验 ──────────────────────────────────────────────────────────────
 
     _TYPE_MAP = {"string": str, "number": (int, float), "integer": int, "boolean": bool, "array": list, "object": dict}
+
+    @staticmethod
+    def _agent_name(agent_type: Any) -> str:
+        value = getattr(agent_type, "value", agent_type)
+        return str(value).strip().lower()
+
+    @staticmethod
+    def _validate_tool_definition(tool: Tool) -> None:
+        """启动阶段校验工具定义，避免错误工具被静默加载。"""
+        if not isinstance(tool.name, str) or not tool.name.strip():
+            raise ValueError("工具 name 必须是非空字符串")
+        if not isinstance(tool.description, str) or not tool.description.strip():
+            raise ValueError(f"工具 {tool.name} 的 description 不能为空")
+        if not callable(tool.handler):
+            raise ValueError(f"工具 {tool.name} 的 handler 不可调用")
+        if not isinstance(tool.schema, dict) or tool.schema.get("type") != "object":
+            raise ValueError(f"工具 {tool.name} 的 schema 必须是 object JSON Schema")
+
+        properties = tool.schema.get("properties", {})
+        required = tool.schema.get("required", [])
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            raise ValueError(f"工具 {tool.name} 的 properties/required 定义非法")
+        missing = [field for field in required if field not in properties]
+        if missing:
+            raise ValueError(f"工具 {tool.name} 的必填字段未定义: {missing}")
+
+        normalized_agents = frozenset(
+            str(getattr(agent, "value", agent)).strip().lower()
+            for agent in tool.allowed_agents
+        )
+        known_agents = {"general", "technical", "billing"}
+        if not normalized_agents.issubset(known_agents):
+            raise ValueError(
+                f"工具 {tool.name} 包含未知 Agent: "
+                f"{sorted(normalized_agents - known_agents)}"
+            )
+        tool.allowed_agents = normalized_agents
 
     def _validate_params(self, tool: Tool, params: Dict[str, Any]) -> None:
         """根据工具的 JSON Schema 校验参数，不合法时抛出 ValueError。"""

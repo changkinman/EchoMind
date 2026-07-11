@@ -16,6 +16,7 @@
   - Agent 置信度低于阈值 → 自动升级到更高级 Agent 或转人工
 """
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -26,6 +27,7 @@ from typing import Any, Dict, List, Optional
 from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
+from mcp.tool_manager import MCPToolManager
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,18 @@ class AgentStats:
 
 
 @dataclass
+class ToolCallTrace:
+    """一次 Agent 工具调用的可观测轨迹。"""
+    round:         int
+    tool_call_id:  str
+    tool_name:     str
+    arguments:     Dict[str, Any]
+    success:       bool
+    result:        Any = None
+    error:         Optional[str] = None
+    latency_ms:    float = 0.0
+
+@dataclass
 class AgentResponse:
     agent_type:  AgentType
     content:     str
@@ -70,6 +84,7 @@ class AgentResponse:
     confidence:  float = 1.0
     latency_ms:  float = 0.0
     escalate:    bool  = False   # 是否需要升级
+    tool_calls:  List[ToolCallTrace] = field(default_factory=list)
 
 
 @dataclass
@@ -92,6 +107,7 @@ class OrchestratorResult:
     intent:      Optional[IntentCategory]
     escalated:   bool  = False
     latency_ms:  float = 0.0
+    tool_calls:  List[ToolCallTrace] = field(default_factory=list)
 
 
 # ── 基础 Agent ────────────────────────────────────────────────────────────────
@@ -102,16 +118,24 @@ class BaseAgent:
     agent_type: AgentType
     system_prompt: str
 
-    def __init__(self, client: AsyncAnthropic, model: str):
+    def __init__(
+        self,
+        client: Any,
+        model: str,
+        tool_manager: Optional[MCPToolManager] = None,
+        max_tool_rounds: int = 5,
+    ):
         self._client = client
-        self._model  = model
-        self.stats   = AgentStats()
+        self._model = model
+        self._tool_manager = tool_manager
+        self._max_tool_rounds = max(1, int(max_tool_rounds))
+        self.stats = AgentStats()
 
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
         try:
-            content = await self._call_llm(req)
+            content, tool_calls = await self._call_llm(req)
             ms = (time.monotonic() - t0) * 1000
             self.stats.success += 1
             self.stats.total_ms += ms
@@ -122,6 +146,7 @@ class BaseAgent:
                 success=True,
                 latency_ms=ms,
                 escalate=escalate,
+                tool_calls=tool_calls,
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
@@ -134,23 +159,157 @@ class BaseAgent:
                 latency_ms=ms,
             )
 
-    async def _call_llm(self, req: Request) -> str:
-        def _clean(s: str) -> str:
-            return s.encode("utf-8", errors="ignore").decode("utf-8")
+    async def _call_llm(self, req: Request) -> tuple[str, List[ToolCallTrace]]:
+        def _clean(value: str) -> str:
+            return value.encode("utf-8", errors="ignore").decode("utf-8")
 
-        messages = []
+        messages: List[Dict[str, Any]] = []
         if req.context:
             messages.append({"role": "user", "content": f"[背景信息]\n{_clean(req.context)}"})
             messages.append({"role": "assistant", "content": "好的，我已了解背景信息。"})
         messages.append({"role": "user", "content": _clean(req.message)})
 
-        resp = await self._client.messages.create(
-            model=self._model,
-            max_tokens=1024,
-            system=self.system_prompt,
-            messages=messages,
+        tool_definitions = (
+            self._tool_manager.anthropic_tools_for_agent(self.agent_type)
+            if self._tool_manager else []
         )
-        return resp.content[0].text
+        traces: List[ToolCallTrace] = []
+
+        for round_no in range(1, self._max_tool_rounds + 1):
+            response = await self._request_model(messages, tool_definitions)
+            blocks = self._serialize_content(response.content)
+            tool_uses = [block for block in blocks if block.get("type") == "tool_use"]
+
+            if not tool_uses:
+                text = self._text_from_blocks(blocks)
+                return text or "抱歉，我暂时无法生成有效回复。", traces
+
+            messages.append({"role": "assistant", "content": blocks})
+            executions = await asyncio.gather(
+                *(self._execute_tool_use(block, req, round_no) for block in tool_uses)
+            )
+            tool_results = []
+            for tool_result, trace in executions:
+                tool_results.append(tool_result)
+                traces.append(trace)
+            messages.append({"role": "user", "content": tool_results})
+
+            if round_no == self._max_tool_rounds:
+                final_response = await self._request_model(messages, None, force_text=True)
+                final_blocks = self._serialize_content(final_response.content)
+                text = self._text_from_blocks(final_blocks)
+                return text or "工具调用已达到上限，请根据现有结果稍后重试。", traces
+
+        return "工具调用已达到上限，请稍后重试。", traces
+
+    async def _request_model(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        force_text: bool = False,
+    ) -> Any:
+        system = self.system_prompt
+        if tools:
+            system += (
+                "你可以调用已提供的工具获取可靠信息。需要工具时先调用工具，"
+                "收到结果后再决定是否继续调用，最后用自然语言回答用户。"
+            )
+        if force_text:
+            system += "现在请停止调用工具，并仅根据已有工具结果生成最终回答。"
+
+        kwargs: Dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": 1024,
+            "system": system,
+            "messages": messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        return await self._client.messages.create(**kwargs)
+
+    async def _execute_tool_use(
+        self,
+        block: Dict[str, Any],
+        req: Request,
+        round_no: int,
+    ) -> tuple[Dict[str, Any], ToolCallTrace]:
+        tool_call_id = str(block.get("id", ""))
+        tool_name = str(block.get("name", ""))
+        raw_arguments = block.get("input", {})
+        arguments = raw_arguments if isinstance(raw_arguments, dict) else {}
+
+        if not isinstance(raw_arguments, dict):
+            success, data, error, latency_ms = False, None, "工具参数必须是对象", 0.0
+        elif self._tool_manager is None:
+            success, data, error, latency_ms = False, None, "工具管理器未初始化", 0.0
+        else:
+            context = {
+                "user_id": req.user_id,
+                "conv_id": req.conv_id,
+                "request_id": req.request_id,
+                "agent_type": self.agent_type.value,
+            }
+            try:
+                result = await self._tool_manager.call(
+                    tool_name,
+                    arguments,
+                    context,
+                    caller_agent=self.agent_type,
+                )
+                success = result.success
+                data = result.data
+                error = result.error
+                latency_ms = result.latency_ms
+            except Exception as ex:
+                success, data, error, latency_ms = False, None, str(ex), 0.0
+
+        payload = {"success": success, "data": data, "error": error}
+        tool_result = {
+            "type": "tool_result",
+            "tool_use_id": tool_call_id,
+            "content": json.dumps(payload, ensure_ascii=False, default=str),
+            "is_error": not success,
+        }
+        trace = ToolCallTrace(
+            round=round_no,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            success=success,
+            result=data,
+            error=error,
+            latency_ms=latency_ms,
+        )
+        return tool_result, trace
+
+    @staticmethod
+    def _serialize_content(content: Any) -> List[Dict[str, Any]]:
+        serialized: List[Dict[str, Any]] = []
+        for block in content or []:
+            if isinstance(block, dict):
+                serialized.append(dict(block))
+            elif hasattr(block, "model_dump"):
+                serialized.append(block.model_dump(mode="json", exclude_none=True))
+            else:
+                block_type = getattr(block, "type", "")
+                if block_type == "text":
+                    serialized.append({"type": "text", "text": getattr(block, "text", "")})
+                elif block_type == "tool_use":
+                    serialized.append({
+                        "type": "tool_use",
+                        "id": getattr(block, "id", ""),
+                        "name": getattr(block, "name", ""),
+                        "input": getattr(block, "input", {}),
+                    })
+        return serialized
+
+    @staticmethod
+    def _text_from_blocks(blocks: List[Dict[str, Any]]) -> str:
+        return "\n".join(
+            str(block.get("text", "")).strip()
+            for block in blocks
+            if block.get("type") == "text" and str(block.get("text", "")).strip()
+        )
 
     def _needs_escalation(self, content: str) -> bool:
         """检测 Agent 是否建议升级（简单关键词检测）。"""
@@ -208,19 +367,23 @@ class AgentOrchestrator:
         api_key:  str,
         base_url: Optional[str] = None,
         model:    str = "claude-3-5-sonnet-20241022",
+        tool_manager: Optional[MCPToolManager] = None,
+        max_tool_rounds: int = 5,
+        client: Optional[Any] = None,
     ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs)
+        if client is None:
+            kwargs: Dict[str, Any] = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = AsyncAnthropic(**kwargs)
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
-            AgentType.GENERAL:   [GeneralAgent(client, model)],
-            AgentType.TECHNICAL: [TechnicalAgent(client, model)],
-            AgentType.BILLING:   [BillingAgent(client, model)],
+            AgentType.GENERAL:   [GeneralAgent(client, model, tool_manager, max_tool_rounds)],
+            AgentType.TECHNICAL: [TechnicalAgent(client, model, tool_manager, max_tool_rounds)],
+            AgentType.BILLING:   [BillingAgent(client, model, tool_manager, max_tool_rounds)],
         }
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
@@ -263,6 +426,7 @@ class AgentOrchestrator:
             intent=req.intent,
             escalated=escalated,
             latency_ms=(time.monotonic() - t0) * 1000,
+            tool_calls=response.tool_calls,
         )
 
     async def run_parallel(self, req: Request, agent_types: List[AgentType]) -> OrchestratorResult:
@@ -276,9 +440,12 @@ class AgentOrchestrator:
 
         # 合并：拼接所有成功响应
         parts = []
+        tool_calls: List[ToolCallTrace] = []
         for r in responses:
             if isinstance(r, AgentResponse) and r.success:
                 parts.append(f"[{r.agent_type.value}]\n{r.content}")
+            if isinstance(r, AgentResponse):
+                tool_calls.extend(r.tool_calls)
 
         combined = "\n\n".join(parts) if parts else "抱歉，所有 Agent 均处理失败。"
         escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
@@ -290,6 +457,7 @@ class AgentOrchestrator:
             intent=req.intent,
             escalated=escalated,
             latency_ms=(time.monotonic() - t0) * 1000,
+            tool_calls=tool_calls,
         )
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────

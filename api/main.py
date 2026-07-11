@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -78,19 +78,13 @@ async def lifespan(app: FastAPI):
     from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
+    from tools.loader import discover_agent_tools
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
 
     # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
     recognizer = IntentRecognizer(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
-
-    # Agent 编排器
-    _orchestrator = AgentOrchestrator(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
@@ -147,6 +141,17 @@ async def lifespan(app: FastAPI):
         fallback=knowledge_fallback,
     ))
 
+    agent_tool_names = discover_agent_tools(_tool_manager)
+    logger.info(f"Agent 工具已加载: {agent_tool_names}")
+
+    # Agent 编排器在工具注册完成后创建，确保所有 Agent 取得完整工具目录。
+    _orchestrator = AgentOrchestrator(
+        api_key=cfg["api_key"],
+        base_url=cfg.get("base_url"),
+        model=cfg["model"],
+        tool_manager=_tool_manager,
+        max_tool_rounds=int(os.getenv("MAX_TOOL_ROUNDS", "5")),
+    )
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
     _monitor = PerformanceMonitor(
@@ -198,6 +203,17 @@ class ChatRequest(BaseModel):
     conv_id:     Optional[str] = None
 
 
+class ToolCallResponse(BaseModel):
+    round:        int
+    tool_call_id: str
+    tool_name:    str
+    arguments:    Dict[str, Any] = Field(default_factory=dict)
+    success:      bool
+    result:       Any = None
+    error:        Optional[str] = None
+    latency_ms:   float = 0.0
+
+
 class ChatResponse(BaseModel):
     conv_id:     str
     response:    str
@@ -206,6 +222,7 @@ class ChatResponse(BaseModel):
     escalated:   bool
     latency_ms:  float
     knowledge_used: bool = False
+    tool_calls: List[ToolCallResponse] = Field(default_factory=list)
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -271,6 +288,19 @@ async def chat(req: ChatRequest):
         escalated=result.escalated,
         latency_ms=round(result.latency_ms, 1),
         knowledge_used=knowledge_used,
+        tool_calls=[
+            ToolCallResponse(**{
+                "round": trace.round,
+                "tool_call_id": trace.tool_call_id,
+                "tool_name": trace.tool_name,
+                "arguments": trace.arguments,
+                "success": trace.success,
+                "result": trace.result,
+                "error": trace.error,
+                "latency_ms": round(trace.latency_ms, 1),
+            })
+            for trace in result.tool_calls
+        ],
     )
 
 
@@ -522,9 +552,21 @@ async def _cli():
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from memory.conversation_memory import MemoryManager, MsgRole
+    from mcp.tool_manager import MCPToolManager
+    from tools.loader import discover_agent_tools
 
     cfg = _anthropic_cfg()
-    orch = AgentOrchestrator(api_key=cfg["api_key"], base_url=cfg.get("base_url"), model=cfg["model"])
+    tool_manager = MCPToolManager(
+        api_key=cfg["api_key"], base_url=cfg.get("base_url"), model=cfg["model"]
+    )
+    discover_agent_tools(tool_manager)
+    orch = AgentOrchestrator(
+        api_key=cfg["api_key"],
+        base_url=cfg.get("base_url"),
+        model=cfg["model"],
+        tool_manager=tool_manager,
+        max_tool_rounds=int(os.getenv("MAX_TOOL_ROUNDS", "5")),
+    )
     mem  = MemoryManager(
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         chroma_host=os.getenv("CHROMA_HOST", "localhost"),
